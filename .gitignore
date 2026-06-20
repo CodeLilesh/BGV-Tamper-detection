@@ -1,5 +1,15 @@
-*.mp4
-*jpeg
-*.png
-*.pdf
-*/__pycache/
+# Debug/temp files
+debug_*.png
+debug_*.jpeg
+uploads/
+*.dec.pdf
+scratch_pdf_text.txt
+
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

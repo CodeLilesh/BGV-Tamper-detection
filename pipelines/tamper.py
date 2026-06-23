@@ -63,8 +63,17 @@ def detect_tampering(filepath):
         result['error'] = f'Cannot process document: {str(e)}'
         return result
 
+    # Detect document characteristics for scoring adjustments
+    is_scanned = file_ext == 'pdf' and _is_scanned_pdf(raw_text, image)
+    is_high_contrast = _is_high_contrast_image(image)
+    doc_context = {
+        'is_scanned': is_scanned,
+        'is_pdf': file_ext == 'pdf',
+        'is_high_contrast': is_high_contrast,
+    }
+
     # Module A: Error Level Analysis (multi-quality, JPEG only)
-    ela_result = run_ela(image, file_ext)
+    ela_result = run_ela(image, file_ext, doc_context)
     result['module_scores']['ela'] = ela_result['score']
     result['checks'].append({
         'name': 'Error Level Analysis (ELA)',
@@ -86,7 +95,7 @@ def detect_tampering(filepath):
         })
 
     # Module B: Noise Inconsistency Analysis
-    noise_result = run_noise_analysis(image)
+    noise_result = run_noise_analysis(image, doc_context)
     result['module_scores']['noise'] = noise_result['score']
     result['checks'].append({
         'name': 'Noise Inconsistency Analysis',
@@ -102,7 +111,7 @@ def detect_tampering(filepath):
         })
 
     # Module C: DCT Block Coefficient Analysis
-    dct_result = run_dct_block_analysis(image)
+    dct_result = run_dct_block_analysis(image, doc_context)
     result['module_scores']['dct'] = dct_result['score']
     result['checks'].append({
         'name': 'DCT Block Coefficient Analysis',
@@ -118,7 +127,7 @@ def detect_tampering(filepath):
         })
 
     # Module D: Copy-Move Patch Detection
-    copy_result = run_copy_move_detection(image)
+    copy_result = run_copy_move_detection(image, doc_context)
     result['module_scores']['copy_move'] = copy_result['score']
     result['checks'].append({
         'name': 'Copy-Move Patch Detection',
@@ -223,11 +232,37 @@ def pdf_to_image(filepath):
     raise Exception("Cannot render PDF to image. Try uploading as JPG/PNG.")
 
 
+def _is_scanned_pdf(raw_text, image):
+    """Heuristic: if extractable text is very sparse relative to image size, it's a scan."""
+    if not raw_text or len(raw_text.strip()) < 50:
+        return True
+    text_density = len(raw_text.strip()) / (image.width * image.height + 1)
+    return text_density < 0.0001
+
+
+def _is_high_contrast_image(image):
+    """Detect born-digital/vector-rendered images with sharp edges and flat regions."""
+    gray = np.array(image.convert('L'), dtype=np.float64)
+    h, w = gray.shape
+    block_size = 64
+    variances = []
+    for y in range(0, min(h, 512), block_size):
+        for x in range(0, min(w, 512), block_size):
+            block = gray[y:y+block_size, x:x+block_size]
+            if block.size > 0:
+                variances.append(np.var(block))
+    if not variances:
+        return False
+    var_arr = np.array(variances)
+    near_zero = np.sum(var_arr < 50) / len(var_arr)
+    return near_zero > 0.4
+
+
 # ============================================
 # Module A: Error Level Analysis (Enhanced)
 # ============================================
 
-def run_ela(image, source_format='jpeg'):
+def run_ela(image, source_format='jpeg', doc_context=None):
     """
     Enhanced ELA — run at multiple JPEG quality levels and analyze
     per-block variance. Edited regions have inconsistent compression
@@ -240,7 +275,7 @@ def run_ela(image, source_format='jpeg'):
     result = {'score': 0.0, 'detail': '', 'flag_desc': 'ELA skipped (lossless source)'}
 
     # ELA only works on JPEG/lossy sources
-    if source_format.lower() in ('png', 'pdf', 'bmp', 'tiff', 'tif', 'gif'):
+    if source_format.lower() in ('png', 'bmp', 'tiff', 'tif', 'gif'):
         result['detail'] = f'Skipped — ELA requires a JPEG source (got {source_format.upper()})'
         result['flag_desc'] = 'ELA not applicable to lossless/rendered documents'
         return result
@@ -272,8 +307,11 @@ def run_ela(image, source_format='jpeg'):
         # Coefficient of variation: high = inconsistent compression = edited
         cv = std_d / (mean_d + 1e-6)
 
-        # Hotspot detection: pixels 2.5σ above mean are anomalous
-        hotspot_threshold = mean_d + 2.5 * std_d
+        # Hotspot detection: pixels above sigma-threshold are anomalous
+        # PDF-rendered & scanned images have inherently higher variance,
+        # so use a wider sigma band to avoid false hotspots
+        hotspot_sigma = 3.5 if (doc_context and (doc_context.get('is_pdf') or doc_context.get('is_scanned'))) else 2.5
+        hotspot_threshold = mean_d + hotspot_sigma * std_d
         hotspot_mask = gray_diff > hotspot_threshold
         hotspot_ratio = np.sum(hotspot_mask) / hotspot_mask.size
 
@@ -281,21 +319,37 @@ def run_ela(image, source_format='jpeg'):
         if HAS_CV2:
             hm_uint8 = (hotspot_mask * 255).astype(np.uint8)
             n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hm_uint8)
-            large_clusters = sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] > 200)
+            # Require larger clusters for PDFs (small clusters are rendering artifacts)
+            min_cluster_area = 500 if (doc_context and doc_context.get('is_pdf')) else 200
+            large_clusters = sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] > min_cluster_area)
         else:
             large_clusters = 0
 
+        # Adaptive thresholds — PDF/scanned images require stronger signals
+        if doc_context and doc_context.get('is_scanned'):
+            cv_t = (3.5, 2.5, 1.8)
+            hr_t = (0.20, 0.12, 0.05)
+            cl_t = (10, 5)
+        elif doc_context and doc_context.get('is_pdf'):
+            cv_t = (3.0, 2.2, 1.5)
+            hr_t = (0.15, 0.08, 0.03)
+            cl_t = (8, 4)
+        else:
+            cv_t = (2.0, 1.5, 1.0)
+            hr_t = (0.08, 0.04, 0.01)
+            cl_t = (5, 2)
+
         score = 0.0
-        if cv > 2.0:     score += 0.35
-        elif cv > 1.5:   score += 0.25
-        elif cv > 1.0:   score += 0.15
+        if cv > cv_t[0]:     score += 0.35
+        elif cv > cv_t[1]:   score += 0.25
+        elif cv > cv_t[2]:   score += 0.15
 
-        if hotspot_ratio > 0.08:   score += 0.35
-        elif hotspot_ratio > 0.04: score += 0.20
-        elif hotspot_ratio > 0.01: score += 0.10
+        if hotspot_ratio > hr_t[0]:   score += 0.35
+        elif hotspot_ratio > hr_t[1]: score += 0.20
+        elif hotspot_ratio > hr_t[2]: score += 0.10
 
-        if large_clusters > 5:     score += 0.30
-        elif large_clusters > 2:   score += 0.15
+        if large_clusters > cl_t[0]:     score += 0.30
+        elif large_clusters > cl_t[1]:   score += 0.15
 
         result['score'] = min(round(score, 3), 1.0)
         result['detail'] = (
@@ -326,7 +380,7 @@ def run_ela(image, source_format='jpeg'):
 # Module B: Noise Inconsistency Analysis
 # ============================================
 
-def run_noise_analysis(image):
+def run_noise_analysis(image, doc_context=None):
     """
     Sensor noise analysis.
     
@@ -376,22 +430,41 @@ def run_noise_analysis(image):
         median_noise = np.median(noise_arr)
         mad = np.median(np.abs(noise_arr - median_noise))  # Median Absolute Deviation
 
-        # Blocks with noise > 3.5 * MAD above/below median are anomalous
-        threshold = 3.5 * (mad + 1e-6)
+        # Adaptive MAD threshold — scanned/high-contrast docs have inherently
+        # non-uniform noise so require a wider deviation to count as anomalous
+        if doc_context and doc_context.get('is_scanned'):
+            mad_factor = 5.5
+        elif doc_context and doc_context.get('is_high_contrast'):
+            mad_factor = 5.0
+        else:
+            mad_factor = 3.5
+
+        threshold = mad_factor * (mad + 1e-6)
         anomalous_blocks = np.sum(np.abs(noise_arr - median_noise) > threshold)
         anomaly_ratio = anomalous_blocks / len(noise_arr)
 
         # Spread check: coefficient of variation of noise across blocks
         noise_cv = np.std(noise_arr) / (np.mean(noise_arr) + 1e-6)
 
-        score = 0.0
-        if anomaly_ratio > 0.20:   score += 0.40
-        elif anomaly_ratio > 0.10: score += 0.25
-        elif anomaly_ratio > 0.05: score += 0.10
+        # Adaptive scoring thresholds
+        if doc_context and doc_context.get('is_scanned'):
+            ar_t = (0.35, 0.22, 0.12)
+            cv_t = (4.0, 2.8, 2.0)
+        elif doc_context and doc_context.get('is_high_contrast'):
+            ar_t = (0.30, 0.18, 0.10)
+            cv_t = (3.5, 2.5, 1.8)
+        else:
+            ar_t = (0.20, 0.10, 0.05)
+            cv_t = (2.5, 1.5, 1.0)
 
-        if noise_cv > 2.5:    score += 0.35
-        elif noise_cv > 1.5:  score += 0.20
-        elif noise_cv > 1.0:  score += 0.10
+        score = 0.0
+        if anomaly_ratio > ar_t[0]:   score += 0.40
+        elif anomaly_ratio > ar_t[1]: score += 0.25
+        elif anomaly_ratio > ar_t[2]: score += 0.10
+
+        if noise_cv > cv_t[0]:    score += 0.35
+        elif noise_cv > cv_t[1]:  score += 0.20
+        elif noise_cv > cv_t[2]:  score += 0.10
 
         result['score'] = min(round(score, 3), 1.0)
         result['detail'] = (
@@ -420,7 +493,7 @@ def run_noise_analysis(image):
 # Module C: DCT Block Coefficient Analysis
 # ============================================
 
-def run_dct_block_analysis(image):
+def run_dct_block_analysis(image, doc_context=None):
     """
     DCT (Discrete Cosine Transform) Block Anomaly Detection.
     
@@ -466,8 +539,14 @@ def run_dct_block_analysis(image):
         global_mean = np.mean(energy_arr)
         global_std  = np.std(energy_arr)
 
-        # Blocks whose energy deviates by more than 3σ from the global are anomalous
-        anomaly_mask = np.abs(energy_arr - global_mean) > 3.0 * global_std
+        # Adaptive sigma — text documents have naturally bimodal AC energy
+        # (text blocks vs blank areas), so require wider deviation for anomaly
+        if doc_context and (doc_context.get('is_scanned') or doc_context.get('is_high_contrast')):
+            sigma_factor = 4.5
+        else:
+            sigma_factor = 3.0
+
+        anomaly_mask = np.abs(energy_arr - global_mean) > sigma_factor * global_std
         anomaly_ratio = np.sum(anomaly_mask) / anomaly_mask.size
 
         # Spatial clustering: check if anomalous blocks are clustered (paste region)
@@ -475,18 +554,27 @@ def run_dct_block_analysis(image):
         if HAS_CV2 and anomaly_ratio > 0.01:
             am_uint8 = (anomaly_mask * 255).astype(np.uint8)
             n_labels, _, stats, _ = cv2.connectedComponentsWithStats(am_uint8)
-            # Large connected components = paste regions
-            large_clusters = sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] > 10)
+            # Require larger clusters for documents (small ones are text edges)
+            min_cluster = 25 if (doc_context and (doc_context.get('is_scanned') or doc_context.get('is_high_contrast'))) else 10
+            large_clusters = sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] > min_cluster)
         else:
             large_clusters = 0
 
-        score = 0.0
-        if anomaly_ratio > 0.15:   score += 0.40
-        elif anomaly_ratio > 0.07: score += 0.25
-        elif anomaly_ratio > 0.03: score += 0.10
+        # Adaptive scoring thresholds
+        if doc_context and (doc_context.get('is_scanned') or doc_context.get('is_high_contrast')):
+            ar_t = (0.25, 0.15, 0.08)
+            cl_t = (6, 3)
+        else:
+            ar_t = (0.15, 0.07, 0.03)
+            cl_t = (3, 1)
 
-        if large_clusters > 3:     score += 0.35
-        elif large_clusters > 1:   score += 0.15
+        score = 0.0
+        if anomaly_ratio > ar_t[0]:   score += 0.40
+        elif anomaly_ratio > ar_t[1]: score += 0.25
+        elif anomaly_ratio > ar_t[2]: score += 0.10
+
+        if large_clusters > cl_t[0]:     score += 0.35
+        elif large_clusters > cl_t[1]:   score += 0.15
 
         result['score'] = min(round(score, 3), 1.0)
         result['detail'] = (
@@ -527,7 +615,7 @@ def _dct2d(block):
 # Module D: Copy-Move Detection
 # ============================================
 
-def run_copy_move_detection(image):
+def run_copy_move_detection(image, doc_context=None):
     """
     Copy-Move / Patch Detection.
     
@@ -562,7 +650,9 @@ def run_copy_move_detection(image):
                 block = img_arr[y:y+BLOCK, x:x+BLOCK]
                 std = np.std(block)
                 # Skip very uniform blocks (blank spaces, white margins)
-                if std < 8.0:
+                # Raise threshold for scans (more repeating patterns like ruled lines)
+                std_threshold = 12.0 if (doc_context and doc_context.get('is_scanned')) else 8.0
+                if std < std_threshold:
                     continue
                 # Downsample to 8x8 for pHash
                 small = np.array(
@@ -580,27 +670,41 @@ def run_copy_move_detection(image):
             result['detail'] = 'Insufficient content blocks for copy-move analysis'
             return result
 
-        # Find near-duplicate blocks using Hamming distance ≤ 6 (allow minor compression noise)
+        # Find near-duplicate blocks using Hamming distance threshold
+        # Scanned docs need stricter matching — repeating patterns (table lines,
+        # headers, ruled lines) create similar-looking blocks that aren't clones
+        max_hamming = 2 if (doc_context and doc_context.get('is_scanned')) else 3
+        min_spatial_dist = BLOCK * 6 if (doc_context and doc_context.get('is_scanned')) else MIN_DIST
+
         copy_pairs = 0
         for i in range(len(block_hashes)):
             for j in range(i + 1, len(block_hashes)):
                 h1, x1, y1 = block_hashes[i]
                 h2, x2, y2 = block_hashes[j]
                 dist_px = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-                if dist_px < MIN_DIST:
+                if dist_px < min_spatial_dist:
                     continue
                 # Hamming distance between the two pHashes
                 xor = h1 ^ h2
                 hamming = bin(xor).count('1')
-                if hamming <= 3:  # Very strict — only pixel-perfect copies count
+                if hamming <= max_hamming:
                     copy_pairs += 1
 
-        score = 0.0
-        if copy_pairs > 200:   score = 0.9
-        elif copy_pairs > 80:  score = 0.7
-        elif copy_pairs > 30:  score = 0.5
-        elif copy_pairs > 10:  score = 0.3
-        elif copy_pairs > 3:   score = 0.15
+        # Adaptive pair-count thresholds — scanned docs need more pairs to trigger
+        if doc_context and doc_context.get('is_scanned'):
+            score = 0.0
+            if copy_pairs > 300:   score = 0.9
+            elif copy_pairs > 150: score = 0.7
+            elif copy_pairs > 60:  score = 0.5
+            elif copy_pairs > 25:  score = 0.3
+            elif copy_pairs > 8:   score = 0.15
+        else:
+            score = 0.0
+            if copy_pairs > 200:   score = 0.9
+            elif copy_pairs > 80:  score = 0.7
+            elif copy_pairs > 30:  score = 0.5
+            elif copy_pairs > 10:  score = 0.3
+            elif copy_pairs > 3:   score = 0.15
 
         result['score'] = round(score, 3)
         result['detail'] = f'{copy_pairs} near-duplicate content block pair(s) at distant positions'
@@ -659,10 +763,11 @@ def run_metadata_forensics(filepath, file_ext, raw_bytes):
                     creator  = str(meta.get('/Creator', '')).lower()
                     producer = str(meta.get('/Producer', '')).lower()
 
+                    # Only flag image-editing tools, not legitimate document creators
+                    # Word/LibreOffice/OpenOffice are normal creation tools for payslips, letters, etc.
                     editing_tools = [
                         'photoshop', 'gimp', 'paint.net', 'pixlr',
-                        'affinity', 'corel', 'inkscape', 'microsoft word',
-                        'libre', 'openoffice'
+                        'affinity', 'corel', 'inkscape',
                     ]
                     for tool in editing_tools:
                         if tool in creator or tool in producer:
@@ -682,7 +787,9 @@ def run_metadata_forensics(filepath, file_ext, raw_bytes):
                     create_date = str(meta.get('/CreationDate', ''))
                     mod_date    = str(meta.get('/ModDate', ''))
                     if create_date and mod_date and create_date != mod_date:
-                        risk_signals.append(('MEDIUM', f'ModDate != CreateDate (document was modified after creation)'))
+                        # Downgraded to LOW — most official docs (payslips, receipts) have
+                        # different ModDate due to templates, digital signatures, or mail merges
+                        risk_signals.append(('LOW', f'ModDate != CreateDate (document was modified after creation)'))
 
                     num_pages = len(reader.pages)
                     result['metadata']['page_count'] = num_pages

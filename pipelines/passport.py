@@ -2,21 +2,27 @@
 BGV Pipeline 2: Passport Verification
 =======================================
 Flow: PDF/Image → OCR MRZ Zone → Parse MRZ (ICAO 9303) → 
-      Validate Check Digits → OCR VIZ → Compare MRZ vs VIZ
+      Validate Check Digits → OCR VIZ (preprocessed) → Compare MRZ vs VIZ
 
 MRZ (Machine Readable Zone) structure for Type 3 passport:
-  Line 1: P<CCCFAMILYNAME<<GIVENNAMES<<<<<<<<<<<<<<<<<
+  Line 1: P<CCCFAMILYNAME<<GIVENNAMES<<<<<<<<<<<<<<<<<<<<
   Line 2: PPPPPPPPPCNNNDDDDDDCGEEEEEECOOOOOOOOOOOOOOC
   
 Where:
   P = Passport number, C = Check digit, N = Nationality,
   D = DOB (YYMMDD), G = Gender, E = Expiry (YYMMDD), O = Optional
+
+v3.0 Changes:
+  - VIZ extraction now uses CLAHE + 2x upsampling + Otsu binarization
+  - Tesseract PSM changed to auto-page (PSM 3) for VIZ, PSM 6 kept for MRZ
+  - DOB patterns expanded to include DD-MMM-YYYY (e.g. 01 JAN 1990)
+  - Improved name heuristics with passport-specific layout hints
 """
 
 import os
 import re
 import traceback
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 
 
@@ -489,86 +495,204 @@ def validate_mrz_checksums(parsed_mrz):
 
 
 def extract_viz_from_text(text):
-    """Extract VIZ fields directly from text."""
+    """
+    Extract VIZ fields directly from native PDF text layer.
+    v3.0: Expanded DOB patterns include DD-MMM-YYYY format.
+    """
     result = {'name': None, 'dob': None, 'gender': None, 'raw_text': text}
-    
+
+    _SKIP_KEYWORDS = {
+        'REPUBLIC', 'INDIA', 'PASSPORT', 'NATIONALITY', 'GIVEN',
+        'SURNAME', 'NAMES', 'BIRTH', 'DATE', 'GENDER', 'PLACE',
+        'EXPIRY', 'ISSUE', 'PERSONAL', 'NUMBER', 'SEX', 'FILE'
+    }
+    _MONTH_MAP = {
+        'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+        'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+        'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+    }
+
     lines = text.strip().split('\n')
     for line in lines:
         line = line.strip()
-        # DOB
+        if not line:
+            continue
+
+        # DOB — numeric formats (DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY)
         dob_match = re.search(r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})', line)
         if dob_match and not result['dob']:
-            result['dob'] = dob_match.group(1)
+            result['dob'] = dob_match.group(1).replace('-', '/').replace('.', '/')
+
+        # DOB — textual format (DD MMM YYYY / DD-MMM-YYYY)
+        if not result['dob']:
+            dob_match2 = re.search(
+                r'(\d{1,2})[\s\-]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s\-]+(\d{4})',
+                line, re.IGNORECASE
+            )
+            if dob_match2:
+                dd = dob_match2.group(1).zfill(2)
+                mm = _MONTH_MAP[dob_match2.group(2).upper()]
+                yyyy = dob_match2.group(3)
+                result['dob'] = f'{dd}/{mm}/{yyyy}'
 
         # Gender
-        if re.search(r'\b(MALE|FEMALE|M|F)\b', line, re.IGNORECASE):
-            match = re.search(r'\b(MALE|FEMALE)\b', line, re.IGNORECASE)
-            if match:
-                result['gender'] = match.group(1).upper()
+        gender_match = re.search(r'\b(MALE|FEMALE)\b', line, re.IGNORECASE)
+        if gender_match and not result['gender']:
+            result['gender'] = gender_match.group(1).upper()
 
-        # Name (heuristic: lines with mostly uppercase letters, no digits)
-        if not result['name'] and len(line) > 3:
-            if sum(1 for c in line if c.isupper()) / max(len(line), 1) > 0.7:
-                if not any(c.isdigit() for c in line):
+        # Name — mostly uppercase, no digits, not a label keyword
+        if not result['name'] and 4 <= len(line) <= 50:
+            upper_ratio = sum(1 for c in line if c.isupper()) / max(len(line), 1)
+            words = set(line.upper().split())
+            if upper_ratio > 0.65 and not any(c.isdigit() for c in line):
+                if not words.intersection(_SKIP_KEYWORDS):
                     result['name'] = line
-                    
+
     return result
 
 
+def _preprocess_for_ocr(image):
+    """
+    Preprocess an image region for high-accuracy Tesseract OCR.
+    Pipeline: Grayscale → CLAHE contrast enhancement → 2× upsample → Otsu binarize
+    """
+    try:
+        import cv2
+        # Convert PIL → numpy
+        img_np = np.array(image.convert('RGB'))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+        # CLAHE — Contrast Limited Adaptive Histogram Equalization
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # Upsample 2× for better glyph resolution (target ~300 DPI equivalent)
+        h, w = gray.shape
+        gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+        # Otsu's binarization — adaptive threshold for mixed backgrounds
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Mild denoising
+        binary = cv2.medianBlur(binary, 3)
+
+        # Convert back to PIL
+        return Image.fromarray(binary)
+
+    except ImportError:
+        # Fallback: PIL-only enhancement without OpenCV
+        img_gray = image.convert('L')
+        # Sharpen + enhance contrast
+        img_gray = ImageEnhance.Contrast(img_gray).enhance(2.0)
+        img_gray = img_gray.filter(ImageFilter.SHARPEN)
+        # Upsample 2×
+        w, h = img_gray.size
+        img_gray = img_gray.resize((w * 2, h * 2), Image.LANCZOS)
+        return img_gray
+    except Exception as e:
+        print(f"[WARN] VIZ preprocessing fallback: {e}")
+        return image
+
+
 def extract_viz_from_image(image):
-    """Extract text from the Visual Inspection Zone (upper part of passport)."""
+    """
+    Extract text from the Visual Inspection Zone (upper portion of passport).
+
+    v3.0: Applies CLAHE + 2× upsample + Otsu binarization before OCR.
+    Uses Tesseract PSM 3 (automatic page segmentation) for the mixed VIZ layout.
+    """
     result = {'name': None, 'dob': None, 'gender': None, 'raw_text': ''}
 
     try:
-        # Crop top 65% of image
+        # Crop top 65% of image (the Visual Inspection Zone)
         width, height = image.size
         top_crop = image.crop((0, 0, width, int(height * 0.65)))
+
+        # ── Preprocess for OCR ────────────────────────────────────────
+        preprocessed = _preprocess_for_ocr(top_crop)
 
         text = ''
 
         try:
             import pytesseract
-            text = pytesseract.image_to_string(top_crop, lang='eng')
+            # PSM 3: Fully automatic page segmentation — best for VIZ area
+            # (PSM 6 is for uniform text blocks like MRZ; VIZ has mixed layout)
+            text = pytesseract.image_to_string(
+                preprocessed,
+                lang='eng',
+                config='--psm 3 --oem 1'
+            )
+            # Fallback: try on original if preprocessed gives nothing
+            if not text.strip():
+                text = pytesseract.image_to_string(top_crop, lang='eng', config='--psm 3')
         except ImportError:
             try:
                 import subprocess
                 import tempfile
 
                 tmp_path = os.path.join(tempfile.gettempdir(), 'viz_temp.png')
-                top_crop.save(tmp_path)
+                preprocessed.save(tmp_path)
                 proc = subprocess.run(
-                    ['tesseract', tmp_path, 'stdout', '-l', 'eng'],
+                    ['tesseract', tmp_path, 'stdout', '-l', 'eng', '--psm', '3'],
                     capture_output=True, text=True, timeout=30
                 )
                 if proc.returncode == 0:
                     text = proc.stdout
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except:
+            except Exception:
                 pass
 
         if text:
             result['raw_text'] = text
-            # Extract fields
             lines = text.strip().split('\n')
 
             for line in lines:
                 line = line.strip()
-                # DOB
+                if not line:
+                    continue
+
+                # ── DOB Patterns ─────────────────────────────────────────
+                # DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
                 dob_match = re.search(r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})', line)
                 if dob_match and not result['dob']:
-                    result['dob'] = dob_match.group(1)
+                    result['dob'] = dob_match.group(1).replace('-', '/').replace('.', '/')
 
-                # Gender
-                if re.search(r'\b(MALE|FEMALE|M|F)\b', line, re.IGNORECASE):
-                    match = re.search(r'\b(MALE|FEMALE)\b', line, re.IGNORECASE)
-                    if match:
-                        result['gender'] = match.group(1).upper()
+                # DD MMM YYYY (e.g. "01 JAN 1990" — common on Indian passports)
+                if not result['dob']:
+                    dob_match2 = re.search(
+                        r'(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{4})',
+                        line, re.IGNORECASE
+                    )
+                    if dob_match2:
+                        month_map = {
+                            'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+                            'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+                            'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+                        }
+                        dd = dob_match2.group(1).zfill(2)
+                        mm = month_map[dob_match2.group(2).upper()]
+                        yyyy = dob_match2.group(3)
+                        result['dob'] = f'{dd}/{mm}/{yyyy}'
 
-                # Name (heuristic: lines with mostly uppercase letters)
-                if not result['name'] and len(line) > 3:
-                    if sum(1 for c in line if c.isupper()) / max(len(line), 1) > 0.7:
-                        if not any(c.isdigit() for c in line):
+                # ── Gender ───────────────────────────────────────────────
+                gender_match = re.search(r'\b(MALE|FEMALE)\b', line, re.IGNORECASE)
+                if gender_match and not result['gender']:
+                    result['gender'] = gender_match.group(1).upper()
+
+                # ── Name Heuristics ──────────────────────────────────────
+                # Passport VIZ name: mostly uppercase, no digits, 4–50 chars,
+                # not a known label keyword
+                _SKIP_KEYWORDS = {
+                    'REPUBLIC', 'INDIA', 'PASSPORT', 'NATIONALITY', 'GIVEN',
+                    'SURNAME', 'NAMES', 'BIRTH', 'DATE', 'GENDER', 'PLACE',
+                    'EXPIRY', 'ISSUE', 'PERSONAL', 'NUMBER', 'SEX', 'FILE'
+                }
+                if not result['name'] and 4 <= len(line) <= 50:
+                    upper_ratio = sum(1 for c in line if c.isupper()) / max(len(line), 1)
+                    words = set(line.upper().split())
+                    if upper_ratio > 0.65 and not any(c.isdigit() for c in line):
+                        if not words.intersection(_SKIP_KEYWORDS):
                             result['name'] = line
 
     except Exception as e:

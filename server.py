@@ -1,6 +1,7 @@
 """
-BGV Document Verification — Flask API Server
+BGV Document Verification — Flask API Server v3.0
 Serves the frontend and handles document verification through pipelines.
+New in v3.0: Digital fingerprinting + blockchain-style audit ledger anchoring.
 """
 
 import os
@@ -17,6 +18,8 @@ from pipelines.aadhaar import verify_aadhaar
 from pipelines.passport import verify_passport
 from pipelines.tamper import detect_tampering
 from pipelines.decision_engine import compute_verdict
+from pipelines.fingerprint import compute_document_fingerprint, create_verification_record
+from pipelines.blockchain_ledger import append_record, verify_chain_integrity, get_ledger_stats
 
 app = Flask(__name__, static_folder='public', static_url_path='')
 
@@ -86,6 +89,33 @@ def verify_document():
             # Decision Engine
             final_result = compute_verdict(pipeline_results, doc_type, candidate_name, candidate_dob)
 
+            # ── v3.0: Digital Fingerprint + Blockchain Anchoring ────────
+            fingerprint = {}
+            ledger_block = {}
+            try:
+                fingerprint = compute_document_fingerprint(filepath, pipeline_results)
+                candidate_id = f"CAND-{hash(candidate_name + candidate_dob) & 0xFFFFFF:06X}"
+                verification_record = create_verification_record(
+                    filepath=filepath,
+                    doc_type=doc_type,
+                    candidate_id=candidate_id,
+                    fingerprint=fingerprint,
+                    pipeline_result=pipeline_results,
+                    verdict=final_result.get('verdict', 'UNKNOWN'),
+                    confidence=final_result.get('confidence', 0),
+                )
+                ledger_block = append_record(verification_record)
+                final_result['fingerprint'] = {
+                    'crypto_hash': fingerprint.get('crypto_hash', ''),
+                    'perceptual_hash': fingerprint.get('perceptual_hash', ''),
+                    'composite_hash': fingerprint.get('composite_hash', ''),
+                    'ledger_block': ledger_block.get('seq'),
+                    'ledger_hash': ledger_block.get('block_hash', '')[:16] + '...',
+                }
+            except Exception as fp_err:
+                print(f"[WARN] Fingerprinting/ledger error (non-fatal): {fp_err}")
+                final_result['fingerprint'] = {'error': str(fp_err)}
+
             return jsonify(final_result)
 
         finally:
@@ -101,9 +131,30 @@ def verify_document():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/ledger/verify', methods=['GET'])
+def ledger_verify():
+    """Verify the integrity of the entire blockchain audit ledger."""
+    try:
+        result = verify_chain_integrity()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/ledger/stats', methods=['GET'])
+def ledger_stats():
+    """Get summary statistics of the audit ledger."""
+    try:
+        stats = get_ledger_stats()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print("  BGV Document Verification Engine v2.1")
+    print("  BGV Document Verification Engine v3.0")
+    print("  Fingerprinting + Blockchain Audit Ledger ENABLED")
     print("  Server running at: http://localhost:5000")
     print("=" * 60 + "\n")
     app.run(host='0.0.0.0', port=5000, debug=True)

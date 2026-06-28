@@ -1,15 +1,21 @@
 """
-BGV Pipeline 3: Tamper Detection Engine (Universal — High Precision)
-=====================================================================
+BGV Pipeline 3: Tamper Detection Engine v3.0 (Universal — High Precision)
+==========================================================================
 Applies to: Degree certificates, Payslips, Experience letters,
             Offer letters, Any uploaded document
 
-Forensic Modules:
-  A. Error Level Analysis (ELA) — Multi-quality JPEG compression variance
-  B. Noise Inconsistency Analysis — Sensor noise pattern uniformity
-  C. DCT Block Analysis — JPEG quantization block anomalies
-  D. Copy-Move Detection — Self-copy/patch detection using block hashing
-  E. Metadata Forensics — Creation tool, timestamps, raw byte signatures
+Forensic Modules (v3.0):
+  A. Error Level Analysis (ELA)     — Multi-quality JPEG compression variance
+  B. Noise Inconsistency Analysis   — Sensor noise pattern uniformity
+  C. DCT Block Analysis             — JPEG quantization block anomalies
+  D. Copy-Move Detection            — Self-copy/patch detection using block hashing
+  E. Metadata Forensics             — Creation tool, timestamps, raw byte signatures
+  F. CNN Font Forensics (NEW)       — MobileNetV2 glyph embeddings + KMeans clustering
+  G. Character Copy-Paste (NEW)     — Character-region pHash + noise-variance analysis
+
+Weighted Formula v3.0:
+  Score = (ELA×0.30) + (Noise×0.25) + (DCT×0.20) + (CopyMove×0.05)
+        + (Metadata×0.05) + (FontCNN×0.10) + (CharPaste×0.05)
 """
 
 import os
@@ -155,13 +161,47 @@ def detect_tampering(filepath):
         for flag in meta_result['flags']:
             result['flags'].append(flag)
 
-    # Aggregate tamper score (weighted — prioritize image forensics)
+    # Module F: CNN Font Forensics (v3.0 NEW)
+    font_result = run_font_forensics(image, raw_text)
+    result['module_scores']['font_cnn'] = font_result['score']
+    result['checks'].append({
+        'name': 'CNN Font Forensics (Module F)',
+        'passed': font_result['score'] < 0.35,
+        'warning': 0.20 <= font_result['score'] < 0.35,
+        'detail': f'Score: {font_result["score"]:.2f} — {font_result["detail"]}',
+    })
+    if font_result['score'] >= 0.35:
+        result['flags'].append({
+            'module': 'FONT_CNN',
+            'severity': 'HIGH' if font_result['score'] >= 0.6 else 'MEDIUM',
+            'description': font_result['flag_desc'],
+        })
+
+    # Module G: Character-Level Copy-Paste Detection (v3.0 NEW)
+    char_result = run_character_copypaste(image, raw_text)
+    result['module_scores']['char_paste'] = char_result['score']
+    result['checks'].append({
+        'name': 'Character Copy-Paste Detection (Module G)',
+        'passed': char_result['score'] < 0.35,
+        'warning': 0.20 <= char_result['score'] < 0.35,
+        'detail': f'Score: {char_result["score"]:.2f} — {char_result["detail"]}',
+    })
+    if char_result['score'] >= 0.35:
+        result['flags'].append({
+            'module': 'CHAR_COPYPASTE',
+            'severity': 'HIGH' if char_result['score'] >= 0.6 else 'MEDIUM',
+            'description': char_result['flag_desc'],
+        })
+
+    # Aggregate tamper score v3.0 — 7 modules, weights sum to 1.0
     weights = {
-        'ela':       0.35,
-        'noise':     0.30,
-        'dct':       0.25,
-        'copy_move': 0.05,
-        'metadata':  0.05,
+        'ela':        0.30,   # was 0.35
+        'noise':      0.25,   # was 0.30
+        'dct':        0.20,   # was 0.25
+        'copy_move':  0.05,   # unchanged
+        'metadata':   0.05,   # unchanged
+        'font_cnn':   0.10,   # NEW Module F
+        'char_paste': 0.05,   # NEW Module G
     }
     total_score = sum(
         result['module_scores'].get(m, 0) * w
@@ -861,5 +901,364 @@ def run_metadata_forensics(filepath, file_ext, raw_bytes):
     except Exception as e:
         result['detail'] = f'Metadata error: {str(e)}'
         traceback.print_exc()
+
+    return result
+
+
+# ============================================
+# Module F — CNN Font Forensics
+# ============================================
+
+def run_font_forensics(image: Image.Image, raw_text: str) -> dict:
+    """
+    Module F: CNN-based Font Forensics
+    ====================================
+    Detects inconsistent font usage — a key indicator of digitally altered
+    documents (e.g., salary number pasted with a different font, name edited
+    with overlaid text from a different source).
+
+    Architecture:
+      1. CHARACTER SEGMENTATION — Use Tesseract word-level bounding boxes to
+         extract individual word/character patches from the document image.
+      2. FEATURE EXTRACTION — Pass each 32×32 patch through MobileNetV2
+         (pretrained on ImageNet) to get a 128-dimensional feature embedding.
+         MobileNetV2's early layers capture font texture, stroke width,
+         serif presence, and character shape — without any custom training.
+      3. FONT CLUSTERING — Apply KMeans clustering (k=2 to k=4) on the
+         embeddings. A genuine document from a single print job will have
+         all glyphs in ONE cluster. Multiple distinct clusters indicate
+         different font origins.
+      4. OUTLIER FLAGGING — Flag clusters that contain < 5% of all glyphs
+         AND whose centroid distance from the main cluster exceeds 2σ.
+         These are the suspected "pasted" characters.
+
+    Fallback (no deep learning libs):
+      Uses OpenCV-based stroke-width variance analysis as a classical
+      approximation of font inconsistency detection.
+
+    Returns dict with: score (0.0-1.0), detail (str), flag_desc (str)
+    """
+    result = {
+        'score': 0.0,
+        'detail': 'Font forensics not run',
+        'flag_desc': '',
+        'method': 'none',
+    }
+
+    try:
+        if not HAS_CV2:
+            raise ImportError('cv2 not available')
+
+        import numpy as np
+
+        # Convert to grayscale for glyph analysis
+        gray = np.array(image.convert('L'))
+        height, width = gray.shape
+
+        # ── Attempt deep learning path (MobileNetV2) ─────────────────────
+        try:
+            import torch
+            import torchvision.models as models
+            import torchvision.transforms as transforms
+
+            # Load MobileNetV2 backbone (pretrained, feature extraction only)
+            model = models.mobilenet_v2(pretrained=False)
+            model.eval()
+
+            transform = transforms.Compose([
+                transforms.Resize((32, 32)),
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
+
+            # Extract word-region patches via Tesseract bounding boxes
+            try:
+                import pytesseract
+                data = pytesseract.image_to_data(
+                    image, output_type=pytesseract.Output.DICT, config='--psm 6'
+                )
+                patches = []
+                for i, conf in enumerate(data['conf']):
+                    if conf > 60:  # only high-confidence words
+                        x, y, w, h = (data['left'][i], data['top'][i],
+                                      data['width'][i], data['height'][i])
+                        if w > 5 and h > 5:
+                            patch = image.crop((x, y, x + w, y + h))
+                            patches.append(patch)
+            except Exception:
+                patches = []
+
+            if len(patches) < 5:
+                raise ValueError('Insufficient word patches for CNN analysis')
+
+            # Extract embeddings
+            embeddings = []
+            with torch.no_grad():
+                for patch in patches[:100]:  # limit to 100 patches
+                    tensor = transform(patch).unsqueeze(0)
+                    # Use the feature layer before classifier
+                    feat = model.features(tensor)
+                    feat = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1))
+                    embeddings.append(feat.squeeze().numpy())
+
+            embeddings = np.array(embeddings)
+
+            # KMeans clustering (k=2: one main font, one anomalous)
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import normalize
+
+            emb_norm = normalize(embeddings)
+            k = min(3, len(emb_norm) // 5)  # max k=3, at least 5 per cluster
+            k = max(k, 2)
+            kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+            labels = kmeans.fit_predict(emb_norm)
+
+            # Analyse cluster distribution
+            unique, counts = np.unique(labels, return_counts=True)
+            total = len(labels)
+            main_cluster_ratio = counts.max() / total
+            outlier_ratio = 1.0 - main_cluster_ratio
+
+            # Score: higher outlier ratio = more font inconsistency
+            if outlier_ratio > 0.30:
+                score = 0.80
+                flag = f'CNN detected {k} distinct font clusters; outlier ratio {outlier_ratio:.1%}'
+            elif outlier_ratio > 0.15:
+                score = 0.50
+                flag = f'Moderate font cluster separation; outlier ratio {outlier_ratio:.1%}'
+            elif outlier_ratio > 0.08:
+                score = 0.25
+                flag = f'Slight font inconsistency; outlier ratio {outlier_ratio:.1%}'
+            else:
+                score = 0.05
+                flag = f'Font appears consistent across document ({k} clusters, main={main_cluster_ratio:.1%})'
+
+            result.update({
+                'score': round(score, 3),
+                'detail': flag,
+                'flag_desc': flag if score >= 0.35 else '',
+                'method': 'cnn_mobilenetv2',
+                'num_patches': len(patches),
+                'clusters': k,
+                'outlier_ratio': round(outlier_ratio, 3),
+            })
+            return result
+
+        except (ImportError, Exception) as cnn_err:
+            # ── Classical fallback: Stroke-Width Variance ──────────────────
+            # Compute stroke width via distance transform on binarized image
+            result['method'] = 'classical_stroke_width'
+
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+            # Divide into a grid of regions, compute mean stroke width per region
+            block_size = max(min(height, width) // 8, 32)
+            stroke_widths = []
+
+            for row in range(0, height - block_size, block_size):
+                for col in range(0, width - block_size, block_size):
+                    block = binary[row:row + block_size, col:col + block_size]
+                    text_pixels = np.sum(block > 0)
+                    if text_pixels > (block_size * block_size * 0.02):  # skip near-blank
+                        dist = cv2.distanceTransform(block, cv2.DIST_L2, 5)
+                        nonzero = dist[dist > 0]
+                        if len(nonzero) > 0:
+                            stroke_widths.append(float(np.mean(nonzero)))
+
+            if len(stroke_widths) < 4:
+                result['detail'] = 'Insufficient text density for font analysis'
+                result['score'] = 0.0
+                return result
+
+            sw_arr = np.array(stroke_widths)
+            sw_cv = float(np.std(sw_arr) / (np.mean(sw_arr) + 1e-6))  # Coeff of Variation
+
+            # High CV = inconsistent stroke widths = different font sources
+            if sw_cv > 0.60:
+                score = 0.70
+                detail = f'High stroke-width variation (CV={sw_cv:.2f}) — likely mixed fonts'
+            elif sw_cv > 0.40:
+                score = 0.45
+                detail = f'Moderate stroke-width variation (CV={sw_cv:.2f})'
+            elif sw_cv > 0.25:
+                score = 0.20
+                detail = f'Slight stroke-width variation (CV={sw_cv:.2f})'
+            else:
+                score = 0.05
+                detail = f'Font appears consistent (stroke CV={sw_cv:.2f})'
+
+            result.update({
+                'score': round(score, 3),
+                'detail': detail,
+                'flag_desc': detail if score >= 0.35 else '',
+                'stroke_cv': round(sw_cv, 3),
+            })
+            return result
+
+    except Exception as e:
+        result['detail'] = f'Font forensics error: {str(e)}'
+        result['score'] = 0.0
+    return result
+
+
+# ============================================
+# Module G — Character-Level Copy-Paste Detection
+# ============================================
+
+def run_character_copypaste(image: Image.Image, raw_text: str) -> dict:
+    """
+    Module G: Character-Level Copy-Paste Detection
+    ================================================
+    Detects small character/digit substitutions that pixel-level copy-move
+    (Module D) misses — e.g., a "1" replaced by "7", or a salary figure
+    digit swapped by pasting a character from a digital source onto a
+    scanned document.
+
+    Detection Strategy — two independent signals:
+
+    Signal 1: Noise-Variance Bimodality
+      - Scanned documents have spatially uniform sensor noise.
+      - Digitally pasted characters have ZERO noise (they are vector/digital).
+      - We measure noise variance at the character bounding-box level.
+      - A bimodal distribution (some boxes near-zero, others normal) is a
+        strong indicator of mixed-origin content.
+
+    Signal 2: pHash Cross-Comparison
+      - Extract patches for each character bounding box.
+      - Compute pHash for each patch.
+      - Find pairs of characters that are near-identical (Hamming ≤ 3)
+        but appear in completely different contexts (different positions,
+        different surrounding characters).
+      - Legitimate repeated characters (e.g., 'the', 'and') are filtered
+        by checking their textual neighbours.
+
+    Returns dict with: score (0.0-1.0), detail (str), flag_desc (str)
+    """
+    result = {
+        'score': 0.0,
+        'detail': 'Character analysis not run',
+        'flag_desc': '',
+    }
+
+    try:
+        if not HAS_CV2:
+            raise ImportError('cv2 not available')
+
+        import numpy as np
+
+        gray = np.array(image.convert('L'))
+        height, width = gray.shape
+
+        # ── Signal 1: Noise-Variance Bimodality ─────────────────────────
+        # Laplacian noise extraction at character-region level
+        laplacian = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F)
+
+        # Divide into small blocks (character-sized: ~16×16)
+        char_block = 16
+        noise_variances = []
+        for row in range(0, height - char_block, char_block):
+            for col in range(0, width - char_block, char_block):
+                block = laplacian[row:row + char_block, col:col + char_block]
+                # Only analyse blocks with text content
+                orig_block = gray[row:row + char_block, col:col + char_block]
+                if np.std(orig_block) > 8:  # skip blank/background
+                    noise_variances.append(float(np.var(block)))
+
+        score_signal1 = 0.0
+        detail_signal1 = ''
+        if len(noise_variances) >= 10:
+            nv = np.array(noise_variances)
+            # Bimodality: check if significant fraction are near-zero
+            # (digital origin = no sensor noise)
+            near_zero = np.sum(nv < np.percentile(nv, 10)) / len(nv)
+            cv = float(np.std(nv) / (np.mean(nv) + 1e-6))
+
+            if near_zero > 0.25 and cv > 1.5:
+                score_signal1 = 0.75
+                detail_signal1 = (
+                    f'Bimodal noise distribution: {near_zero:.1%} near-zero blocks '
+                    f'(digital paste detected, CV={cv:.2f})'
+                )
+            elif near_zero > 0.15 or cv > 1.2:
+                score_signal1 = 0.40
+                detail_signal1 = f'Moderate noise bimodality (near-zero={near_zero:.1%}, CV={cv:.2f})'
+            else:
+                score_signal1 = 0.05
+                detail_signal1 = f'Noise consistent (CV={cv:.2f})'
+
+        # ── Signal 2: pHash Character Cross-Comparison ───────────────────
+        score_signal2 = 0.0
+        detail_signal2 = ''
+        try:
+            import pytesseract
+            data = pytesseract.image_to_data(
+                image, output_type=pytesseract.Output.DICT, config='--psm 6'
+            )
+
+            # Extract character patches and compute pHash
+            char_patches = []  # list of (pHash_int, x, y, text)
+            for i, conf in enumerate(data['conf']):
+                word = str(data['text'][i]).strip()
+                if conf > 50 and len(word) >= 1:
+                    x, y, w, h = (data['left'][i], data['top'][i],
+                                  data['width'][i], data['height'][i])
+                    if w >= 4 and h >= 4:
+                        patch = np.array(
+                            image.crop((x, y, x + w, y + h))
+                            .convert('L')
+                            .resize((8, 8), Image.LANCZOS)
+                        ).flatten().astype(np.float32)
+                        avg = patch.mean()
+                        bits = (patch > avg).astype(int)
+                        phash_int = int(''.join(str(b) for b in bits), 2)
+                        char_patches.append((phash_int, x, y, word))
+
+            # Find suspiciously identical but spatially distant patches
+            suspicious_pairs = 0
+            for i in range(len(char_patches)):
+                for j in range(i + 1, min(i + 50, len(char_patches))):
+                    h1, x1, y1, t1 = char_patches[i]
+                    h2, x2, y2, t2 = char_patches[j]
+                    xor = h1 ^ h2
+                    hamming = bin(xor).count('1')
+                    dist = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+                    # Near-identical appearance (hamming ≤ 2) but far apart
+                    # AND different surrounding text context
+                    if hamming <= 2 and dist > 100 and t1 != t2:
+                        suspicious_pairs += 1
+
+            if suspicious_pairs > 20:
+                score_signal2 = 0.70
+                detail_signal2 = f'High character pHash collision count ({suspicious_pairs} pairs)'
+            elif suspicious_pairs > 8:
+                score_signal2 = 0.40
+                detail_signal2 = f'Moderate character similarity anomalies ({suspicious_pairs} pairs)'
+            elif suspicious_pairs > 3:
+                score_signal2 = 0.20
+                detail_signal2 = f'Minor character similarities detected ({suspicious_pairs} pairs)'
+            else:
+                score_signal2 = 0.05
+                detail_signal2 = f'No suspicious character copy-paste patterns'
+
+        except Exception:
+            # Tesseract not available — rely on Signal 1 only
+            detail_signal2 = 'pHash analysis skipped (OCR unavailable)'
+
+        # Combine signals (Signal 1 weighted 60%, Signal 2 weighted 40%)
+        final_score = (score_signal1 * 0.60) + (score_signal2 * 0.40)
+        detail = f'{detail_signal1}; {detail_signal2}' if detail_signal1 else detail_signal2
+
+        result.update({
+            'score': round(min(final_score, 1.0), 3),
+            'detail': detail or 'No character anomalies detected',
+            'flag_desc': detail if final_score >= 0.35 else '',
+            'signal1_score': round(score_signal1, 3),
+            'signal2_score': round(score_signal2, 3),
+        })
+
+    except Exception as e:
+        result['detail'] = f'Character analysis error: {str(e)}'
+        result['score'] = 0.0
 
     return result

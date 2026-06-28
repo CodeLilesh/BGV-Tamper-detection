@@ -1,6 +1,6 @@
 # 🔒 BGV Document Verification Engine — Complete Technical Reference
 
-> **Version:** 2.1 &nbsp;|&nbsp; **Engine:** `tamper-detection-v2.1` &nbsp;|&nbsp; **Last Updated:** June 2026
+> **Version:** 3.0 &nbsp;|&nbsp; **Engine:** `tamper-detection-v3.0` &nbsp;|&nbsp; **Last Updated:** June 2026
 
 ---
 
@@ -16,18 +16,22 @@
 8. [Verdict System](#8-verdict-system)
 9. [Confidence Scoring Model](#9-confidence-scoring-model)
 10. [Glossary of Terms](#10-glossary-of-terms)
+11. [Digital Fingerprinting & Blockchain Layer ✨ NEW](#11-digital-fingerprinting--blockchain-layer)
+12. [CNN Font Forensics Module ✨ NEW](#12-cnn-font-forensics-module)
+13. [Character-Level Copy-Paste Detection ✨ NEW](#13-character-level-copy-paste-detection)
 
 ---
 
 ## 1. System Overview
 
-The **BGV (Background Verification) Document Verification Engine** is an automated system designed to verify the authenticity of identity documents submitted during employee background checks. It processes uploaded documents through specialized verification pipelines and produces a verdict: **VERIFIED**, **SUSPICIOUS**, or **REJECTED**.
+The **BGV (Background Verification) Document Verification Engine v3.0** is an automated system designed to verify the authenticity of identity documents submitted during employee background checks. It processes uploaded documents through specialized verification pipelines and produces a verdict: **VERIFIED**, **SUSPICIOUS**, or **REJECTED**.
 
 ### What It Does
-- **Aadhaar Cards:** Decrypts password-protected e-Aadhaar PDFs, extracts and verifies the embedded QR code's cryptographic signature against UIDAI's official certificate, and cross-checks QR data with the visible text on the document.
-- **Passports:** Extracts and parses the Machine Readable Zone (MRZ), validates all ICAO 9303 check digits, and compares MRZ data with the Visual Inspection Zone (VIZ).
-- **Other Documents (Degree Certificates, Payslips, Experience Letters, etc.):** Runs forensic image analysis to detect pixel-level tampering, editing tool traces, and metadata anomalies.
-- **Cross-Verification:** Optionally compares the candidate's expected name and date of birth against the data found on the document.
+- **Aadhaar Cards:** Decrypts password-protected e-Aadhaar PDFs, extracts and verifies the embedded QR code’s cryptographic signature against UIDAI’s official certificate, and cross-checks QR data with the visible text on the document.
+- **Passports:** Extracts and parses the Machine Readable Zone (MRZ), validates all ICAO 9303 check digits, and compares MRZ data with the Visual Inspection Zone (VIZ) using a preprocessed OCR pipeline (CLAHE → 2× upsample → Otsu binarization).
+- **Other Documents (Degree Certificates, Payslips, Experience Letters, etc.):** Runs 7-module forensic analysis including ELA, Noise Analysis, DCT, Copy-Move, Metadata, **CNN Font Forensics**, and **Character Copy-Paste Detection**.
+- **Cross-Verification:** Optionally compares the candidate’s expected name and date of birth against the data found on the document.
+- **Digital Fingerprinting (v3.0 NEW):** Every processed document receives a three-layer fingerprint (SHA-256 cryptographic hash + perceptual hash + content hash) anchored to a blockchain-style hash-chained immutable ledger.
 
 ---
 
@@ -36,25 +40,26 @@ The **BGV (Background Verification) Document Verification Engine** is an automat
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      USER / HR PORTAL                           │
-│                 Uploads Document + Metadata                     │
+│          Uploads Document + Metadata (Workday / React UI)       │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    FLASK API SERVER                              │
+│                    FLASK API SERVER v3.0                        │
 │               POST /api/verify                                  │
 │   • Validates file type (PDF, JPG, PNG)                         │
 │   • Saves to /uploads/ temporarily                              │
 │   • Routes to correct pipeline based on docType                 │
-└──────────────┬──────────────┬──────────────┬────────────────────┘
+└──────────────┼──────────────┼──────────────┼────────────────────┘
                │              │              │
-    ┌──────────▼──┐   ┌──────▼──────┐  ┌────▼──────────────┐
-    │  AADHAAR    │   │  PASSPORT   │  │ TAMPER DETECTION   │
-    │  PIPELINE   │   │  PIPELINE   │  │ ENGINE             │
-    │  (aadhaar)  │   │  (passport) │  │ (other/degree/etc) │
-    └──────────┬──┘   └──────┬──────┘  └────┬──────────────┘
-               │              │              │
-               └──────────────┼──────────────┘
+    ┌──────────▼──┐   ┌─────▼─────┐  ┌────▼──────────────┐
+    │  AADHAAR    │   │  PASSPORT │  │ TAMPER DETECTION  │
+    │  PIPELINE   │   │  PIPELINE │  │ ENGINE v3.0       │
+    │  (aadhaar)  │   │ (passport)│  │ Modules A–G       │
+    │             │   │  VIZ FIXED│  │ + CNN Font + Char │
+    └──────────┼──┘   └─────┼─────┘  └────────┼──────────┘
+               │            │                 │
+               └────────────┴─────────────────┘
                               │
                               ▼
                ┌──────────────────────────────┐
@@ -67,16 +72,16 @@ The **BGV (Background Verification) Document Verification Engine** is an automat
                               ▼
                ┌──────────────────────────────┐
                │       FINAL VERDICT          │
-               │  ✅ VERIFIED                  │
-               │  ⚠️  SUSPICIOUS               │
-               │  ❌ REJECTED                  │
-               │  + Confidence Score (0-100)   │
+               │  ✅ VERIFIED                 │
+               │  ⚠️  SUSPICIOUS              │
+               │  ❌ REJECTED                 │
+               │  + Confidence Score (0-100)  │
                └──────────────────────────────┘
 ```
 
 ### Architecture Diagram
 
-![BGV System Architecture](system_architecture_1781978000521.png)
+![BGV System Architecture v3.0](system_architecture_v3.png)
 
 ---
 
@@ -91,9 +96,14 @@ The **BGV (Background Verification) Document Verification Engine** is an automat
 | **Aadhaar QR Parsing** | pyaadhaar, manual bigint→gzip→binary decoder | Decode Secure QR v2 payloads |
 | **Cryptographic Verification** | pyHanko, cryptography | PKCS#7/CMS PDF signature validation |
 | **MRZ Parsing** | Custom ICAO 9303 parser | Machine Readable Zone extraction & checksums |
-| **OCR Engine** | Tesseract (pytesseract) | Optical Character Recognition for text extraction |
+| **OCR Engine** | Tesseract (pytesseract) | OCR for MRZ (PSM 6) and VIZ (PSM 3) |
+| **VIZ Preprocessing ✨ v3.0** | OpenCV (CLAHE, Otsu), PIL | Contrast norm + upsample before VIZ OCR |
 | **Image Processing** | Pillow (PIL), NumPy, OpenCV | Image manipulation, ELA, noise analysis |
 | **PDF Metadata** | PyPDF2 | Metadata extraction and forensic analysis |
+| **Digital Fingerprinting ✨ v3.0** | hashlib (SHA-256), scipy/PIL (pHash) | Three-layer document fingerprint |
+| **Blockchain Ledger ✨ v3.0** | hashlib, JSON (NDJSON) | Hash-chained immutable audit ledger |
+| **CNN Font Forensics ✨ v3.0** | PyTorch + MobileNetV2, scikit-learn KMeans | Glyph embedding + font cluster analysis |
+| **Character Copy-Paste ✨ v3.0** | OpenCV (Laplacian), pytesseract (bbox) | Noise bimodality + character pHash collisions |
 
 ### Frontend
 | Component | Technology | Purpose |
@@ -123,7 +133,7 @@ The **BGV (Background Verification) Document Verification Engine** is an automat
 
 ### Sub-Architecture
 
-![Aadhaar Pipeline Architecture](aadhaar_pipeline_arch_1781978012801.png)
+![Aadhaar Pipeline Architecture](aadhaar_pipeline_v3.png)
 
 ### Flow
 ```
@@ -233,7 +243,7 @@ Encrypted PDF + Password
 
 ### Sub-Architecture
 
-![Passport Pipeline Architecture](passport_pipeline_arch_1781978026103.png)
+![Passport Pipeline Architecture v3.0](passport_pipeline_v3.png)
 
 ### Flow
 ```
@@ -351,7 +361,7 @@ PDF or Image File
 
 ### Sub-Architecture
 
-![Tamper Detection Engine Architecture](tamper_pipeline_arch_1781978036771.png)
+![Tamper Detection Engine Architecture v3.0](tamper_pipeline_v3.png)
 
 ### Applies To
 Degree certificates, payslips, experience letters, offer letters, and **any uploaded document** that is not an Aadhaar or Passport.
@@ -455,8 +465,11 @@ Uploaded Document (PDF/JPG/PNG)
 ### Weighted Aggregation Formula
 
 ```
-Tamper Score = (ELA × 0.35) + (Noise × 0.30) + (DCT × 0.25) + (CopyMove × 0.05) + (Metadata × 0.05)
+Tamper Score v3.0 = (ELA × 0.30) + (Noise × 0.25) + (DCT × 0.20) + (CopyMove × 0.05)
+                  + (Metadata × 0.05) + (FontCNN × 0.10) + (CharPaste × 0.05)
 ```
+
+> **Weight rationale v3.0:** ELA and Noise weights reduced slightly to accommodate the two new ML-based modules (FontCNN at 10%, CharPaste at 5%). Total still sums to 1.0.
 
 | Score Range | Meaning |
 |---|---|
@@ -470,7 +483,7 @@ Tamper Score = (ELA × 0.35) + (Noise × 0.30) + (DCT × 0.25) + (CopyMove × 0.
 
 ### Architecture
 
-![Decision Engine Architecture](decision_engine_arch_1781978066949.png)
+![Decision Engine Architecture](decision_engine_v3.png)
 
 ### How the Decision Engine Works
 
@@ -626,5 +639,209 @@ The confidence score is a **0-100** integer representing how confident the syste
 ---
 
 > **Document maintained by:** BGV Engineering Team  
-> **Engine version:** tamper-detection-v2.1  
-> **Pipeline files:** `pipelines/aadhaar.py`, `pipelines/passport.py`, `pipelines/tamper.py`, `pipelines/decision_engine.py`
+> **Engine version:** tamper-detection-v3.0  
+> **Pipeline files:** `pipelines/aadhaar.py`, `pipelines/passport.py`, `pipelines/tamper.py`, `pipelines/decision_engine.py`, `pipelines/fingerprint.py`, `pipelines/blockchain_ledger.py`
+
+---
+
+## 11. Digital Fingerprinting & Blockchain Layer
+
+### Overview
+
+Every document processed by the BGV engine receives a **three-layer digital fingerprint** and its verification record is permanently anchored to an **immutable hash-chained ledger**.
+
+This transforms the system from a point-in-time verification check into a **verifiable, tamper-proof audit ecosystem** that:
+- Prevents re-use of already-rejected documents across hiring cycles
+- Enables cross-employer verification without exposing candidate PII
+- Provides legally defensible audit trails for compliance
+- Detects duplicate or resubmitted documents instantly
+
+### Three-Layer Fingerprint
+
+| Layer | Hash Type | What It Captures | Tamper Sensitivity |
+|---|---|---|---|
+| **Layer 1** | SHA-256 (raw bytes) | Byte-exact file identity | Any single byte change → completely different hash |
+| **Layer 2** | Perceptual Hash (pHash) | Visual appearance of rendered document | Detects visual edits; robust to minor encoding changes |
+| **Layer 3** | Content Hash (SHA-256 of extracted fields) | MRZ data / QR payload / OCR text | Binds fingerprint to semantic document content |
+| **Composite** | SHA-256(L1 | L2 | L3) | Combined identity | Master hash over all three layers |
+
+### Blockchain Ledger Architecture
+
+![Blockchain & Fingerprint Architecture](blockchain_fingerprint_v3.png)
+
+```
+Genesis Block (Block 0)
+     │  block_hash_0 = SHA256("BGV-GENESIS-v3.0" + ledger_path)
+     │
+Block 1: { seq:1, prev_hash: block_hash_0, record: {...}, timestamp }
+     │  block_hash_1 = SHA256(canonical_JSON_of_Block_1)
+     │
+Block 2: { seq:2, prev_hash: block_hash_1, record: {...}, timestamp }
+     │  block_hash_2 = SHA256(canonical_JSON_of_Block_2)
+     ⋮
+```
+
+Any tampering with any historical record **breaks all subsequent hashes**, making fraud immediately detectable via `GET /api/ledger/verify`.
+
+### VerificationRecord Schema
+
+```json
+{
+  "schema_version": "3.0",
+  "document_id": "DOC-1751097600000",
+  "doc_type": "passport",
+  "candidate_id": "CAND-A1B2C3",
+  "timestamp_utc": "2026-06-28T08:00:00Z",
+  "engine_version": "tamper-detection-v3.0",
+  "fingerprint": {
+    "crypto_hash": "a3f1...",
+    "perceptual_hash": "f0e1d2c3b4a59687",
+    "content_hash": "7b2c...",
+    "composite_hash": "9d4e..."
+  },
+  "verification": {
+    "verdict": "VERIFIED",
+    "confidence_score": 95,
+    "flags": [],
+    "pipeline": "passport"
+  },
+  "record_hash": "e5f6..."
+}
+```
+
+### Security Properties
+
+| Property | Mechanism |
+|---|---|
+| **Non-repudiation** | Block timestamp + chain hash proves verification moment |
+| **Tamper-evidence** | SHA-256 chain breaks on any historical modification |
+| **PII-protection** | Only hashes stored — no names, DOBs, or document images |
+| **Replay detection** | Same document → same SHA-256 → flagged as duplicate submission |
+| **Cross-employer portability** | Candidate shares composite_hash; new employer queries `/api/ledger/lookup` |
+
+### Production Extension Paths
+
+| Option | Technology | Use Case |
+|---|---|---|
+| **Local ledger (current)** | NDJSON hash-chain | Dev / Designathon demo |
+| **Private blockchain** | Hyperledger Fabric | Enterprise, GDPR-compliant |
+| **Public blockchain** | Polygon/Ethereum (L2) | Public verifiability, ~\$0.001/record |
+| **Timestamping service** | OpenTimestamps / RFC3161 | Lightweight proof without full chain |
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/verify` | POST | Verify document; returns fingerprint + ledger block ref |
+| `/api/ledger/verify` | GET | Verify entire chain integrity (walk all blocks) |
+| `/api/ledger/stats` | GET | Summary stats: total records, verdicts, doc types |
+
+---
+
+## 12. CNN Font Forensics Module
+
+### Purpose
+
+Detects inconsistent font usage in a document — one of the most reliable indicators of digital tampering. When a fraudster changes a salary number or name by pasting characters from a different source, those characters inevitably have a different font texture, stroke width, or kerning.
+
+### Pipeline
+
+![CNN Font Forensics & Character Copy-Paste Detection](bgv_cnn_font_forensics.png)
+
+```
+Document Image
+       │
+       ▼
+┌───────────────────────────────┐
+│  STAGE 1: Character Segmentation  │
+│  Tesseract word bounding boxes     │
+│  → N word/glyph patches (32×32)   │
+└─────────────────┼─────────────┘
+                  │
+                  ▼
+┌───────────────────────────────┐
+│  STAGE 2: CNN Feature Extraction   │
+│  MobileNetV2 backbone (ImageNet)   │
+│  → 128-dim embedding per patch     │
+│  Captures: stroke width, serif,    │
+│  kerning, character shape          │
+└─────────────────┼─────────────┘
+                  │
+                  ▼
+┌───────────────────────────────┐
+│  STAGE 3: KMeans Font Clustering   │
+│  k = 2 to 4 clusters              │
+│  Genuine doc: one tight cluster    │
+│  Tampered doc: 2+ distinct clusters│
+└─────────────────┼─────────────┘
+                  │
+                  ▼
+         Module F Score (0.0→1.0)
+```
+
+### Scoring
+
+| Outlier Ratio | Score | Interpretation |
+|---|---|---|
+| > 30% | 0.80 | Strong font inconsistency — likely tampered |
+| 15–30% | 0.50 | Moderate font separation |
+| 8–15% | 0.25 | Slight inconsistency (warning) |
+| < 8% | 0.05 | Font appears consistent |
+
+### Fallback Mode (Classical)
+
+When PyTorch is not available, the module falls back to **stroke-width variance analysis** using OpenCV distance transform:
+- Binarize image (Otsu threshold)
+- Compute distance transform (stroke-width proxy)
+- Measure Coefficient of Variation across grid blocks
+- High CV → inconsistent strokes → suspected mixed fonts
+
+| Weight | Module Code |
+|---|---|
+| **0.10** (10%) | `font_cnn` |
+
+---
+
+## 13. Character-Level Copy-Paste Detection
+
+### Purpose
+
+The existing Module D (Copy-Move, 32×32 pixel blocks) operates at a coarse granularity. It misses the most subtle fraud: a single character or digit swapped by pasting from a digital source onto a scanned document. Module G targets exactly this.
+
+### Two Independent Detection Signals
+
+#### Signal 1: Noise-Variance Bimodality
+
+| Attribute | Detail |
+|---|---|
+| **What it checks** | Whether the Laplacian noise variance distribution across 16×16 character-sized blocks is bimodal |
+| **Why it works** | Scanned documents have uniform sensor noise. Digitally pasted characters have near-zero noise (they are vector/raster-digital). A bimodal distribution (many near-zero blocks + normal blocks) indicates mixed-origin content |
+| **Scoring** | near_zero > 25% AND CV > 1.5 → 0.75; near_zero > 15% OR CV > 1.2 → 0.40; else → 0.05 |
+
+#### Signal 2: Character pHash Cross-Comparison
+
+| Attribute | Detail |
+|---|---|
+| **What it checks** | Whether any character bounding-box patches are near-identical (Hamming distance ≤ 2) but spatially distant AND in different textual contexts |
+| **Why it works** | A legitimate repeated character (e.g., two instances of the letter 'a') will appear in similar contexts. A pasted character from a different source appears in an anomalous context with a visually identical patch to an unrelated character elsewhere |
+| **Scoring** | > 20 suspicious pairs → 0.70; > 8 → 0.40; > 3 → 0.20; else → 0.05 |
+
+### Combined Score
+
+```
+Module G Score = (Signal_1 × 0.60) + (Signal_2 × 0.40)
+```
+
+| Weight | Module Code |
+|---|---|
+| **0.05** (5%) | `char_paste` |
+
+### What This Catches That Module D Misses
+
+| Fraud Type | Module D | Module G |
+|---|---|---|
+| Large region copy-paste (e.g., stamp clone) | ✅ Detected | ✅ Detected |
+| Single digit substitution ("1" → "7") | ❌ Missed | ✅ Detected |
+| Salary figure digitally typed over scan | ❌ Missed | ✅ Detected |
+| Small character pasted from PDF | ❌ Missed | ✅ Detected |
+| Entire line replaced from digital source | ⚠️ Partial | ✅ Detected |
